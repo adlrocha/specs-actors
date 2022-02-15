@@ -164,6 +164,16 @@ func (m *expectedMessage) Equal(to addr.Address, method abi.MethodNum, params cb
 	return m.to == to && m.method == method && m.value.Equals(value) && bytes.Equal(paramBuf1.Bytes(), paramBuf2.Bytes())
 }
 
+func (m *expectedMessage) EqualWithSerializedParams(to addr.Address, method abi.MethodNum, params []byte, value abi.TokenAmount) bool {
+	// avoid nil vs. zero/empty discrepancies that would disappear in serialization
+	paramBuf1 := new(bytes.Buffer)
+	if m.params != nil {
+		m.params.MarshalCBOR(paramBuf1) // nolint: errcheck
+	}
+
+	return m.to == to && m.method == method && m.value.Equals(value) && bytes.Equal(paramBuf1.Bytes(), params)
+}
+
 func (m *expectedMessage) String() string {
 	return fmt.Sprintf("to: %v method: %v value: %v params: %v sendReturn: %v exitCode: %v", m.to, m.method, m.value, m.params, m.sendReturn, m.exitCode)
 }
@@ -348,6 +358,61 @@ func (rt *Runtime) Send(toAddr addr.Address, methodNum abi.MethodNum, params cbo
 	exp := rt.expectSends[0]
 
 	if !exp.Equal(toAddr, methodNum, params, value) {
+		toName := "unknown"
+		toMeth := "unknown"
+		expToName := "unknown"
+		expToMeth := "unknown"
+		if code, ok := rt.GetActorCodeCID(toAddr); ok && builtin.IsBuiltinActor(code) {
+			toName = builtin.ActorNameByCode(code)
+			toMeth = getMethodName(code, methodNum)
+		}
+		if code, ok := rt.GetActorCodeCID(exp.to); ok && builtin.IsBuiltinActor(code) {
+			expToName = builtin.ActorNameByCode(code)
+			expToMeth = getMethodName(code, exp.method)
+		}
+
+		rt.failTestNow("unexpected send\n"+
+			"          to: %s (%s) method: %d (%s) value: %v params: %v\n"+
+			"Expected  to: %s (%s) method: %d (%s) value: %v params: %v",
+			toAddr, toName, methodNum, toMeth, value, params, exp.to, expToName, exp.method, expToMeth, exp.value, exp.params)
+	}
+
+	if value.GreaterThan(rt.balance) {
+		rt.Abortf(exitcode.SysErrSenderStateInvalid, "cannot send value: %v exceeds balance: %v", value, rt.balance)
+	}
+
+	// pop the expectedMessage from the queue and modify the mockrt balance to reflect the send.
+	defer func() {
+		rt.expectSends = rt.expectSends[1:]
+		rt.balance = big.Sub(rt.balance, value)
+	}()
+
+	// populate the output argument
+	var buf bytes.Buffer
+	err := exp.sendReturn.MarshalCBOR(&buf)
+	if err != nil {
+		rt.failTestNow("error serializing expected send return: %v", err)
+	}
+	err = out.UnmarshalCBOR(&buf)
+	if err != nil {
+		rt.failTestNow("error deserializing send return bytes to output param: %v", err)
+	}
+
+	return exp.exitCode
+}
+
+// FIXME: This is just a copy from Send. If this ends up making it to production we may want to refactor it a bit.
+func (rt *Runtime) SendWithSerializedParams(toAddr addr.Address, methodNum abi.MethodNum, params []byte, value abi.TokenAmount, out cbor.Er) exitcode.ExitCode {
+	rt.requireInCall()
+	if rt.inTransaction {
+		rt.Abortf(exitcode.SysErrorIllegalActor, "side-effect within transaction")
+	}
+	if len(rt.expectSends) == 0 {
+		rt.failTestNow("unexpected send to: %v method: %v, value: %v, params: %v", toAddr, methodNum, value, params)
+	}
+	exp := rt.expectSends[0]
+
+	if !exp.EqualWithSerializedParams(toAddr, methodNum, params, value) {
 		toName := "unknown"
 		toMeth := "unknown"
 		expToName := "unknown"
